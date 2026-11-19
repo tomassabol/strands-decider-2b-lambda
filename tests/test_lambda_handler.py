@@ -1,9 +1,6 @@
-"""The AWS Lambda handler (deploy/lambda/function/handler.py), over a stand-in backend.
-
-The backend is the one part replaced: llama.cpp and the image are deploy/lambda's to test.
-Everything else, the routes, the status codes and bodies, the settings, the load and the
-model prefetch, is the handler's own. The engine under it is tests/test_hidden_engine.py's.
-"""
+"""function/handler.py over a stand-in backend: llama.cpp and the image are the deploy's to
+test. Everything else, the routes, the status codes and bodies, the settings, the load and the
+model prefetch, is the handler's own."""
 
 from __future__ import annotations
 
@@ -19,16 +16,14 @@ import types
 from pathlib import Path
 from typing import ClassVar
 
-import numpy as np
 import pytest
+from PIL import Image
 from pydantic import ValidationError
-from safetensors.numpy import save_file
-from tokenizers import Tokenizer, models, pre_tokenizers
 
+from conftest import FakeBackend, FakeImageBackend, write_assets
 from strands_decider.hidden_engine import HiddenStateEngine
 
-FUNCTION = Path(__file__).resolve().parents[1] / "deploy" / "lambda" / "function"
-HIDDEN, POINTER = 8, 4
+FUNCTION = Path(__file__).resolve().parents[1] / "function"
 REQUEST = {
     "state": "My renewal failed and I leave on Friday!",
     "questions": {
@@ -42,65 +37,30 @@ REQUEST = {
 }
 
 
-class FakeBackend:
-    """Hidden states drawn from the request's shape, so the same request gets the same ones."""
+class LlamaBackend(FakeBackend):
+    """Stands in for backend.LlamaBackend, recording every backend the handler makes."""
 
-    calls: ClassVar[list[tuple[list[int], list[list[int]], list[list[int]]]]] = []
+    made: ClassVar[list[FakeBackend]] = []
 
     def __init__(self, lib_path: str, model_path: str, threads: int):
+        super().__init__()
         self.args = (lib_path, model_path, threads)
-
-    def forward(self, state, questions, rows):
-        FakeBackend.calls.append((state, questions, rows))
-        rng = np.random.default_rng(len(state))
-        return [
-            rng.normal(size=(len(r), HIDDEN)) + len(q) for q, r in zip(questions, rows, strict=True)
-        ]
+        LlamaBackend.made.append(self)
 
 
-class FakeVisionBackend(FakeBackend):
-    """FakeBackend that also reads images, sizing each as the engine does."""
-
-    images: ClassVar[list[list[tuple[int, int]]]] = []
-
+class LlamaVisionBackend(FakeImageBackend):
     def __init__(self, lib_path: str, model_path: str, mmproj_path: str, threads: int):
-        super().__init__(lib_path, model_path, threads)
+        super().__init__()
+        self.args = (lib_path, model_path, threads)
         self.mmproj_path = mmproj_path
-
-    def forward_images(self, segments, images, questions, rows):
-        FakeVisionBackend.images.append([(w, h) for _, w, h in images])
-        state = [t for segment in segments for t in segment]
-        return self.forward(state, questions, rows), [w // 32 * (h // 32) + 2 for _, w, h in images]
+        LlamaBackend.made.append(self)
 
 
 @pytest.fixture
 def model_dir(tmp_path):
     """What the image holds in /opt/model: the GGUF (any bytes here) and the assets."""
-    assets = tmp_path / "assets"
-    assets.mkdir()
+    write_assets(tmp_path / "assets")
     (tmp_path / "decider.gguf").write_bytes(os.urandom(1000))
-    tok = Tokenizer(models.WordLevel({"<unk>": 0}, unk_token="<unk>"))
-    tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    tok.save(str(assets / "tokenizer.json"))
-    rng = np.random.default_rng(0)
-    head = {
-        "norm.weight": rng.normal(size=HIDDEN),
-        "norm.bias": rng.normal(size=HIDDEN),
-        "q.weight": rng.normal(size=(POINTER, HIDDEN)),
-        "q.bias": rng.normal(size=POINTER),
-        "k.weight": rng.normal(size=(POINTER, HIDDEN)),
-        "k.bias": rng.normal(size=POINTER),
-    }
-    save_file({k: v.astype(np.float32) for k, v in head.items()}, str(assets / "head.safetensors"))
-    config = {
-        "model_name": "tiny-q8_0",
-        "pointer_dim": POINTER,
-        "max_length": 512,
-        "temperature": 1.0,
-        "temperature_by_kind": {},
-        "ordinal_smoothing": 0.0,
-    }
-    (assets / "head_config.json").write_text(json.dumps(config))
     return tmp_path
 
 
@@ -118,12 +78,11 @@ def load(model_dir, monkeypatch):
         monkeypatch.setitem(
             sys.modules,
             "backend",
-            types.SimpleNamespace(LlamaBackend=FakeBackend, LlamaVisionBackend=FakeVisionBackend),
+            types.SimpleNamespace(LlamaBackend=LlamaBackend, LlamaVisionBackend=LlamaVisionBackend),
         )
         monkeypatch.syspath_prepend(str(FUNCTION))
         monkeypatch.delitem(sys.modules, "handler", raising=False)
-        FakeBackend.calls.clear()
-        FakeVisionBackend.images.clear()
+        LlamaBackend.made.clear()
         return importlib.import_module("handler")
 
     yield _load
@@ -156,7 +115,7 @@ def test_loads_the_model_from_the_image(load, model_dir):
     assert lib_path == str(FUNCTION / "libdecider.so")
     assert model_path == str(model_dir / "decider.gguf")
     assert threads == os.cpu_count()
-    assert len(FakeBackend.calls) == 1  # the warm-up, before any request
+    assert len(backend.calls) == 1  # the warm-up, before any request
 
 
 def test_health_reports_the_model_and_settings(load):
@@ -181,7 +140,7 @@ def test_health_reports_the_model_and_settings(load):
 def test_answers_as_the_engine_does(load, model_dir, b64):
     handler = load()
     status, body = call(handler, url_event("POST", "/v1/systemone", REQUEST, b64=b64))
-    engine = HiddenStateEngine.from_assets(str(model_dir / "assets"), FakeBackend("", "", 1))
+    engine = HiddenStateEngine.from_assets(str(model_dir / "assets"), FakeBackend())
     expected = engine.evaluate(REQUEST).model_dump()
     assert status == 200
     assert body.pop("latency_ms") > 0
@@ -221,14 +180,15 @@ def test_invalid_requests_get_fastapis_422(load):
 
 def test_requests_the_engine_refuses_get_422_before_the_forward(load):
     handler = load(DECIDER_MAX_REQUEST_TOKENS="10")
-    FakeBackend.calls.clear()
+    backend = handler._engine.result().backend
+    backend.calls.clear()
     status, body = call(handler, url_event("POST", "/v1/systemone", REQUEST))
     assert status == 422 and "exceeds the limit of 10 tokens per request" in body["detail"]
     status, body = call(
         handler, url_event("POST", "/v1/systemone", {**REQUEST, "images": ["aGk="]})
     )
     assert status == 422 and "images are not supported" in body["detail"]
-    assert not FakeBackend.calls
+    assert not backend.calls
 
 
 def test_on_demand_init_loads_in_the_background(load):
@@ -254,7 +214,7 @@ def test_a_failed_background_load_exits(load, model_dir, monkeypatch):
 def test_a_negative_request_limit_fails_the_init_before_the_load(load):
     with pytest.raises(ValueError, match="must be 0 \\(no limit\\) or more, not -5"):
         load(DECIDER_MAX_REQUEST_TOKENS="-5")
-    assert not FakeBackend.calls  # refused before the model loaded
+    assert not LlamaBackend.made  # refused before the model loaded
 
 
 def test_a_failed_load_at_import_fails_the_init(load, model_dir):
@@ -282,39 +242,34 @@ def test_prefetch_reads_every_byte_once(load, model_dir, monkeypatch):
 
 
 def _png(width: int, height: int) -> str:
-    from PIL import Image
-
     buf = io.BytesIO()
     Image.new("RGB", (width, height), (40, 120, 200)).save(buf, "PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
 
 def test_an_image_with_a_vision_tower_answers_over_images(load, model_dir):
-    pytest.importorskip("PIL")
     (model_dir / "vision.gguf").write_bytes(os.urandom(500))
     handler = load()
     backend = handler._engine.result().backend
-    assert isinstance(backend, FakeVisionBackend)
+    assert isinstance(backend, LlamaVisionBackend)
     assert backend.mmproj_path == str(model_dir / "vision.gguf")
     # The image warm-up: 64 px, raised to the processor grid's least area, 256 x 256.
-    assert FakeVisionBackend.images == [[(256, 256)]]
+    assert [i["sizes"] for i in backend.images] == [[(256, 256)]]
     assert call(handler, url_event("GET", "/health"))[1]["vision"] is True
     status, body = call(
         handler, url_event("POST", "/v1/systemone", {**REQUEST, "images": [_png(600, 400)]})
     )
     assert status == 200 and set(body["answers"]) == {"urgent", "team"}
-    assert FakeVisionBackend.images[-1] == [(448, 288)]  # 448 x 299, on the processor's grid
+    assert backend.images[-1]["sizes"] == [(448, 288)]  # 448 x 299, on the processor's grid
 
 
 def test_an_image_without_a_vision_tower_refuses_images(load):
-    pytest.importorskip("PIL")
     handler = load()
-    assert not isinstance(handler._engine.result().backend, FakeVisionBackend)
+    assert not isinstance(handler._engine.result().backend, LlamaVisionBackend)
     status, body = call(
         handler, url_event("POST", "/v1/systemone", {**REQUEST, "images": [_png(64, 64)]})
     )
     assert status == 422 and "images are not supported" in body["detail"]
-    assert not FakeVisionBackend.images
 
 
 def test_a_fault_in_the_function_is_a_500_with_its_traceback_logged(load, monkeypatch, caplog):
@@ -333,7 +288,6 @@ def test_a_fault_in_the_function_is_a_500_with_its_traceback_logged(load, monkey
 
 
 def test_the_image_size_setting_reaches_the_engine(load, model_dir):
-    pytest.importorskip("PIL")
     (model_dir / "vision.gguf").write_bytes(os.urandom(500))
     handler = load(DECIDER_IMAGE_LONG_SIDE="768")
     assert call(handler, url_event("GET", "/health"))[1]["image_long_side"] == 768
@@ -341,10 +295,12 @@ def test_the_image_size_setting_reaches_the_engine(load, model_dir):
         handler, url_event("POST", "/v1/systemone", {**REQUEST, "images": [_png(1200, 800)]})
     )
     assert status == 200
-    assert FakeVisionBackend.images[-1] == [(768, 512)]  # 768 x 512, already on the grid
+    assert handler._engine.result().backend.images[-1]["sizes"] == [
+        (768, 512)
+    ]  # 768 x 512, already on the grid
 
 
 def test_an_image_size_under_the_grid_fails_the_init_before_the_load(load):
     with pytest.raises(ValueError, match="DECIDER_IMAGE_LONG_SIDE must be 32 or more, not 16"):
         load(DECIDER_IMAGE_LONG_SIDE="16")
-    assert not FakeBackend.calls
+    assert not LlamaBackend.made
