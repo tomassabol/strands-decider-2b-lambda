@@ -1,0 +1,7 @@
+# The files the image is built from. lib/decider-function-stack.ts reads this file too, for the
+# files the deploy uploads to CodeBuild.
+*
+!Dockerfile
+!function/
+!scripts/
+**/__pycache__
