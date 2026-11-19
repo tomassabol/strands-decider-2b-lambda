@@ -1,0 +1,478 @@
+"""Serving one request: N questions against one state.
+
+The headline property of a System One model is that asking more questions about the
+same state barely costs more time. That is not automatic -- it falls out of doing
+the work in the right order:
+
+    1. Encode the state ONCE, keeping its KV cache.          <- the expensive part
+    2. Broadcast that cache across the question batch.
+    3. Forward only the (short) question suffixes.           <- the cheap part
+
+For a 2000-token state and five 40-token questions, the naive approach encodes
+~10,200 tokens; this encodes ~2,200. The questions genuinely evaluate in parallel,
+independently -- no question can see another's text, which is what keeps the answers
+decomposable in the way the API promises.
+
+Set `use_prefix_cache=False` to fall back to plain batched encoding. The two paths
+agree to within float tolerance (tests/test_prefix_cache.py pins that, for plain and hybrid torsos), so the
+fallback is a safety valve rather than a different model.
+"""
+
+from __future__ import annotations
+
+import copy
+import threading
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from . import __version__
+from .modeling import StrandsDeciderModel, apply_temperature, masked_log_softmax, pool_last_token
+from .prompting import (
+    RenderedQuestion,
+    fit_window,
+    option_token_index,
+    render_question,
+    render_state,
+    to_answer,
+)
+from .schema import (
+    Answer,
+    Content,
+    Question,
+    SystemOneRequest,
+    SystemOneResponse,
+    Usage,
+)
+
+
+@dataclass
+class EngineConfig:
+    device: str = "cuda"
+    use_prefix_cache: bool = True
+    max_batch: int = 32
+    model_name: str = f"strands-decider-{__version__}"
+    # Also cap the tokens of one forward: a chunk of up to max_batch questions is cut
+    # where its rows, fitted to the window and padded to the longest (state + question),
+    # would pass this many tokens (one question at least). Questions are fitted before the
+    # cut and scored independently, so answers only move by float rounding; long-context
+    # Gemma torsos need it at a 32,768 window. None: off.
+    max_batch_tokens: int | None = None
+
+
+class UnforkableCache(TypeError):
+    """A KV cache layout `_expand_cache` cannot safely repeat across rows."""
+
+
+# Per-row state a cache layer may hold (transformers 5): attention layers' `keys` and
+# `values`; a linear-attention (Gated DeltaNet) layer's `conv_states` and
+# `recurrent_states`, each a dict of tensors keyed by state index. First dim is the batch.
+_ROW_STATES = ("keys", "values", "conv_states", "recurrent_states")
+# Tensors a cache layer may hold that describe the layer, not a row, and so are shared
+# by every fork unchanged: a sliding-window layer's window size (Gemma 4), a 0-dim tensor.
+_SHARED_TENSORS = ("_sliding_window_tensor",)
+
+
+def _fork_layered_cache(cache: Any, n: int) -> Any:
+    """`n` copies of a batch-1 cache that keeps one object per layer (transformers 5).
+
+    Covers sliding-window layers (Gemma 4 E2B: four of every five), whose only extra
+    tensor is the window size, shared by every fork.
+
+    Covers hybrid torsos: Qwen3.5 mixes attention layers with Gated DeltaNet layers
+    whose recurrent and convolution states must be repeated too, or the suffix forward
+    fails on a shape mismatch. The fork gets new layer objects, new dicts and new
+    tensors: a DeltaNet layer updates its states and flags (`has_previous_state`) in
+    place, so a fork that shared them would corrupt the prefix it came from. The
+    approach is decider-2b's (`decider/shared_prefix.py`, Apache-2.0).
+
+    Raises UnforkableCache for a layer holding tensors under any other name: we cannot tell
+    whether such a tensor has a batch dimension, so the caller falls back to batched
+    encoding rather than guess.
+    """
+    fork = copy.copy(cache)
+    fork.layers = []
+    for layer in cache.layers:
+        nl = copy.copy(layer)
+        for name, v in list(vars(nl).items()):
+            is_state = name in _ROW_STATES
+            if isinstance(v, torch.Tensor):
+                if name in _SHARED_TENSORS and v.dim() == 0:
+                    continue  # per-layer, not per-row: every fork keeps it as it is
+                if not is_state:
+                    raise UnforkableCache(
+                        f"cache layer {type(layer).__name__} holds tensor {name!r}"
+                    )
+                if v.numel():
+                    setattr(nl, name, v.expand(n, *v.shape[1:]).contiguous())
+            elif isinstance(v, dict):
+                if any(isinstance(t, torch.Tensor) for t in v.values()) and not is_state:
+                    raise UnforkableCache(
+                        f"cache layer {type(layer).__name__} holds tensors in {name!r}"
+                    )
+                setattr(
+                    nl,
+                    name,
+                    {
+                        k: t.expand(n, *t.shape[1:]).contiguous()
+                        if isinstance(t, torch.Tensor) and t.numel()
+                        else t
+                        for k, t in v.items()
+                    },
+                )
+        fork.layers.append(nl)
+    return fork
+
+
+def _expand_cache(cache: Any, n: int) -> Any:
+    """Repeat a batch-1 KV cache across `n` rows.
+
+    transformers 5 keeps a per-layer object per layer (`cache.layers`), for plain and
+    hybrid torsos alike; that is the only layout this package admits. `.contiguous()` is
+    not optional: the suffix forward concatenates into these tensors, and an expanded
+    (stride-0) view cannot be written to.
+    """
+    if isinstance(getattr(cache, "layers", None), list):
+        return _fork_layered_cache(cache, n)
+    raise UnforkableCache(f"unsupported KV cache type: {type(cache)!r}")
+
+
+def spans_gpus(torso: torch.nn.Module) -> bool:
+    """True for a torso whose layers were split across GPUs when it loaded."""
+    return len({p.device for p in torso.parameters() if p.device.type == "cuda"}) > 1
+
+
+class SystemOneEngine:
+    """Stateless evaluator around a loaded StrandsDeciderModel."""
+
+    def __init__(self, model: StrandsDeciderModel, config: EngineConfig | None = None):
+        self.cfg = config or EngineConfig()
+        if str(self.cfg.device).startswith("mps"):
+            # No fla/Triton on macOS; replace the reference chunk rule's slow MPS solver.
+            from .mps_kernels import install
+
+            install()
+        elif str(self.cfg.device) == "cpu":
+            # The reference depthwise conv is slow on CPU (per channel without oneDNN); see cpu_kernels.
+            from .cpu_kernels import install as install_cpu
+
+            install_cpu()
+        if spans_gpus(model.torso):
+            # Loaded with a device_map: the layers stay on their GPUs, the head joins the inputs.
+            model.head.to(self.cfg.device)
+            self.model = model.eval()
+        else:
+            self.model = model.to(self.cfg.device).eval()
+        if str(self.cfg.device) == "cpu":
+            self._upcast_torso_for_cpu()
+        self.tok = model.tokenizer
+        self.device = self.cfg.device
+        # Sticky, monotonic False->True: cache the first UnforkableCache so later
+        # requests skip the shared-prefix path without racing on self.cfg.
+        self._prefix_cache_unforkable = False
+        # HuggingFace's fast tokenizer reconfigures its truncation/padding state on
+        # every call, which is not safe to run from two threads at once (it raises
+        # "Already borrowed", or silently uses another thread's max_length).
+        # Tokenisation is cheap relative to the model forward, so holding this is fine.
+        self._tok_lock = threading.Lock()
+
+    def _upcast_torso_for_cpu(self) -> None:
+        """Run a half-precision torso in fp32 on CPU.
+
+        CPU kernels for bf16 are slower than fp32, not faster: on an M3 Pro a
+        256-token v19 question takes 7.7 s in bf16 and 3.5 s in fp32, with the same
+        answer. The cost is memory, about 7 GiB of torso weights instead of 3.5. The
+        readout is already fp32. Done under inference_mode because `load_engine`
+        builds the model there, and inference tensors cannot be modified outside it.
+        """
+        torso = self.model.torso
+        first = next(torso.parameters(), None)  # a stub torso in the tests has none
+        if first is not None and first.dtype in (torch.bfloat16, torch.float16):
+            with torch.inference_mode():
+                torso.to(torch.float32)
+
+    def _temperatures(self, kinds: list[str]) -> torch.Tensor:
+        """Per-row temperature, falling back to the global scalar where unfitted."""
+        cfg = self.model.config
+        by_kind = getattr(cfg, "temperature_by_kind", None) or {}
+        return torch.tensor(
+            [float(by_kind.get(k, cfg.temperature)) for k in kinds],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+    def _fit(
+        self, state_text: str, question_texts: list[str]
+    ) -> tuple[list[int], list[list[int]], list[list[tuple[int, int]]]]:
+        """prompting.fit_window on this engine's tokenizer: state ids, question ids and
+        each question's character offsets.
+
+        The offsets are returned, not kept on the engine: the server runs requests
+        concurrently on one engine, so engine state would be shared across requests.
+        """
+        with self._tok_lock:
+            return fit_window(
+                self.tok.backend_tokenizer,
+                state_text,
+                question_texts,
+                self.model.config.max_length,
+            )
+
+    def _option_idx(
+        self,
+        rendered: list[RenderedQuestion],
+        base: int,
+        offsets: list[list[tuple[int, int]]],
+    ) -> torch.Tensor:
+        """Option token positions for a pointer head, offset by `base`.
+
+        `base` is 0 when the caller forwards only the question (the shared-prefix path,
+        where `hidden` is the suffix) and the state's token count when it forwards the
+        whole prompt. `offsets` come from `_fit`'s tokenisation of the question.
+        """
+        rows = [
+            option_token_index(offs, rq.option_spans, 0)
+            for rq, offs in zip(rendered, offsets, strict=True)
+        ]
+        width = max(len(r) for r in rows)
+        return torch.tensor(
+            [[base + i for i in r] + [-1] * (width - len(r)) for r in rows],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def _pad(self, seqs: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Right-pad to a rectangle; pool_last_token finds the last real token by mask."""
+        pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+        width = max(len(x) for x in seqs)
+        ids = torch.tensor([x + [pad_id] * (width - len(x)) for x in seqs], device=self.device)
+        mask = torch.tensor(
+            [[1] * len(x) + [0] * (width - len(x)) for x in seqs], device=self.device
+        )
+        return ids, mask
+
+    # ---- low level -------------------------------------------------------
+
+    @torch.inference_mode()  # type: ignore[untyped-decorator]
+    def _slot_probs_batched(
+        self,
+        s: list[int],
+        q: list[list[int]],
+        n_slots: list[int],
+        kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
+        rendered: list[RenderedQuestion] | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Fallback: encode each full prompt independently, from `_fit`'s state `s` and
+        questions `q`. Sharing `_fit` with the cached path keeps the two paths' token
+        sequences identical.
+        """
+        ids, mask = self._pad([s + qi for qi in q])
+        # This path forwards the whole prompt, so option positions sit after the state.
+        assert rendered is not None
+        opt_idx = self._option_idx(rendered, len(s), offsets)
+        out = self.model(
+            input_ids=ids,
+            attention_mask=mask,
+            n_slots=torch.tensor(n_slots, device=self.device),
+            temperature=self._temperatures(kinds),
+            opt_idx=opt_idx,
+        )
+        return out["log_probs"].exp(), int(mask.sum().item())
+
+    @torch.inference_mode()  # type: ignore[untyped-decorator]
+    def _slot_probs_shared_prefix(
+        self,
+        s: list[int],
+        q: list[list[int]],
+        n_slots: list[int],
+        kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
+        rendered: list[RenderedQuestion] | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Encode the state `s` once, then all question suffixes `q` against that cache."""
+        m = len(q)
+        # The suffixes continue an already-tokenised sequence, so _fit adds no BOS to
+        # them -- one mid-sequence would be a token training never saw.
+        prefix_ids = torch.tensor([s], device=self.device)
+        prefix_len = prefix_ids.size(1)
+
+        prefix_out = self.model.torso(
+            input_ids=prefix_ids,
+            attention_mask=torch.ones_like(prefix_ids),
+            use_cache=True,
+            return_dict=True,
+        )
+        cache = _expand_cache(prefix_out.past_key_values, m)
+
+        suffix_ids, suffix_mask = self._pad(q)
+        full_mask = torch.cat(
+            [
+                torch.ones(m, prefix_len, dtype=suffix_mask.dtype, device=self.device),
+                suffix_mask,
+            ],
+            dim=1,
+        )
+
+        hidden = self.model.encode(
+            input_ids=suffix_ids,
+            attention_mask=full_mask,
+            past_key_values=cache,
+        )
+        # pool_last_token slices the mask to the forwarded tail, so it lands on the
+        # last real *suffix* token -- which is `<answer>`, the position that has
+        # attended to state and question alike.
+        pooled = pool_last_token(hidden, full_mask).to(torch.float32)
+        # `hidden` is the suffix only, so option positions are suffix-relative and
+        # need no prefix offset -- the cached state never enters the gather.
+        from .modeling import gather_options
+
+        assert rendered is not None
+        options = gather_options(hidden, self._option_idx(rendered, 0, offsets))
+        raw = self.model.head(pooled, options.to(torch.float32))
+        logits = apply_temperature(raw, self._temperatures(kinds))
+        log_probs = masked_log_softmax(logits, torch.tensor(n_slots, device=self.device))
+        n_tokens = prefix_len + int(suffix_mask.sum().item())
+        return log_probs.exp(), n_tokens
+
+    # ---- public ----------------------------------------------------------
+
+    def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
+        if request.images:
+            raise ValueError("this engine has no vision tower; serve with --vision for images")
+        names = list(request.questions.keys())
+        questions: list[Question] = [request.questions[n] for n in names]
+
+        rendered: list[RenderedQuestion] = [render_question(q) for q in questions]
+
+        state_text = render_state(request.state)
+        n_slots = [rq.n_slots for rq in rendered]
+
+        answers: dict[str, Answer] = {}
+        total_tokens = 0
+
+        for chunk, state_ids, question_ids, offsets in self._chunks(state_text, rendered):
+            chunk_rendered = rendered[chunk]
+            chunk_slots = n_slots[chunk]
+            chunk_kinds = [rq.kind for rq in chunk_rendered]
+
+            probs = None
+            # One question gains nothing from a shared prefix and pays a second forward:
+            # measured on JevBench (one question per task), p50 0.111 s batched, 0.204 s
+            # through the prefix path, with the same answers.
+            if (
+                self.cfg.use_prefix_cache
+                and not self._prefix_cache_unforkable
+                and len(chunk_rendered) > 1
+            ):
+                try:
+                    probs, ntok = self._slot_probs_shared_prefix(
+                        state_ids,
+                        question_ids,
+                        chunk_slots,
+                        chunk_kinds,
+                        offsets,
+                        rendered=chunk_rendered,
+                    )
+                    total_tokens += ntok
+                except UnforkableCache as e:
+                    print(
+                        f"[strands-decider] shared-prefix cache disabled ({e}); using batched encoding"
+                    )
+                    self._prefix_cache_unforkable = True
+            if probs is None:
+                probs, ntok = self._slot_probs_batched(
+                    state_ids,
+                    question_ids,
+                    chunk_slots,
+                    chunk_kinds,
+                    offsets,
+                    rendered=chunk_rendered,
+                )
+                total_tokens += ntok
+
+            for i, name in enumerate(names[chunk]):
+                rq = chunk_rendered[i]
+                row = probs[i, : rq.n_slots].tolist()
+                answers[name] = to_answer(
+                    rq, row, ordinal_smoothing=self.model.config.ordinal_smoothing
+                )
+
+        return SystemOneResponse(
+            model=self.cfg.model_name,
+            answers=answers,
+            # One slot decision per question: the output side really is this cheap.
+            usage=Usage(input_tokens=total_tokens, output_tokens=len(names)),
+        )
+
+    def _chunks(
+        self, state_text: str, rendered: list[RenderedQuestion]
+    ) -> list[tuple[slice, list[int], list[list[int]], list[Any]]]:
+        """Consecutive runs of at most max_batch questions, each with its fitted state,
+        questions and option offsets. A run of max_batch is fitted to the window once; with
+        max_batch_tokens set it is then cut where rows x (state + longest question) would
+        pass the cap, which bounds the padded forward and leaves every input as fitted."""
+        k, cap = self.cfg.max_batch, self.cfg.max_batch_tokens
+        out = []
+        for g in range(0, len(rendered), k):
+            s, q, offsets = self._fit(state_text, [rq.text for rq in rendered[g : g + k]])
+            start, longest = 0, 0
+            for i, qi in enumerate(q):
+                if cap and i > start and (i - start + 1) * (len(s) + max(longest, len(qi))) > cap:
+                    out.append((slice(g + start, g + i), s, q[start:i], offsets[start:i]))
+                    start, longest = i, 0
+                longest = max(longest, len(qi))
+            out.append((slice(g + start, g + len(q)), s, q[start:], offsets[start:]))
+        return out
+
+    def ask(self, state: Content, questions: dict[str, Question]) -> SystemOneResponse:
+        return self.evaluate(SystemOneRequest(state=state, questions=questions))
+
+
+@torch.inference_mode()  # type: ignore[untyped-decorator]
+def load_engine(
+    checkpoint: str,
+    *,
+    device: str = "cuda",
+    use_prefix_cache: bool = True,
+    attn_implementation: str | None = None,
+) -> SystemOneEngine:
+    """An engine on a torch device ("cuda", "mps", "cpu"), or on MLX with `device="mlx"`."""
+    if device == "mlx":
+        return load_mlx(checkpoint, EngineConfig(device="mlx", use_prefix_cache=use_prefix_cache))
+    model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
+    return SystemOneEngine(model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache))
+
+
+def mlx_available() -> bool:
+    """True on Apple silicon with the `mlx` extra installed.
+
+    `mlx` is a namespace package: `pip uninstall mlx` can leave an importable `mlx`
+    directory behind (mlx-metal's), so the check is for `mlx.core`.
+    """
+    import importlib.util
+    import platform
+
+    # platform.system(), not sys.platform: mypy narrows sys.platform to the checking
+    # host's, which on CI's Linux runners marks the rest of the function unreachable.
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        return (
+            importlib.util.find_spec("mlx.core") is not None
+            and importlib.util.find_spec("mlx_lm") is not None
+        )
+    except ModuleNotFoundError:  # finding `mlx.core` imports `mlx`, which may be absent
+        return False
+
+
+def load_mlx(checkpoint: str, config: EngineConfig | None = None) -> SystemOneEngine:
+    """An engine with the torso on MLX (see mlx_engine.py), configured as a torch engine is."""
+    if not mlx_available():
+        raise RuntimeError(
+            "device 'mlx' needs Apple silicon and the mlx extra: pip install 'strands-decider[mlx]'"
+        )
+    from .mlx_engine import load_mlx_engine
+
+    return load_mlx_engine(checkpoint, config)
